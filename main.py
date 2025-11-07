@@ -473,46 +473,51 @@ Return as a simple list, one per line, no numbering."""
         return formatted
     
     @staticmethod
-    def build_rag_prompt(query: str, contexts: List[Dict], chat_history: str) -> str:
-        """Build enhanced RAG prompt with structured context"""
-        # Group contexts by type
-        sections = [c for c in contexts if c.get('type') == 'section']
-        tables = [c for c in contexts if c.get('type') == 'table']
+    def format_contexts(contexts: List[Dict]) -> str:
+        """Format contexts into a readable string for the prompt"""
+        if not contexts:
+            return "No relevant documentation found."
         
-        context_text = ""
+        formatted = ""
+        for i, context in enumerate(contexts, 1):
+            section = context.get('section', 'Unknown Section')
+            source = context.get('source', 'Unknown Source')
+            score = context.get('score', 0)
+            text = context.get('text', '')
+            
+            formatted += f"\n--- Context {i} (Score: {score:.3f}) ---\n"
+            formatted += f"Section: {section}\n"
+            formatted += f"Source: {source}\n"
+            formatted += f"Content: {text}\n"
         
-        if sections:
-            context_text += "=== DOCUMENTATION SECTIONS ===\n\n"
-            for i, ctx in enumerate(sections, 1):
-                section_name = ctx.get('section', 'Unknown Section')
-                context_text += f"[Section {i}: {section_name}] (Relevance: {ctx['score']:.2f})\n"
-                context_text += f"{ctx['text']}\n\n"
-        
-        if tables:
-            context_text += "=== RELATED TABLES ===\n\n"
-            for i, ctx in enumerate(tables, 1):
-                context_text += f"[Table {i}] (Relevance: {ctx['score']:.2f})\n"
-                context_text += f"{ctx['text']}\n\n"
-        
-        prompt = f"""You are GenCare Assistant, an expert AI assistant specialized in the GenCare healthcare system (BRS V1.2 documentation).
+        return formatted
+    
+    @staticmethod
+    def build_rag_prompt(query: str, context: str, history: str) -> str:
+        """Build the comprehensive RAG prompt with context and history"""
+        return f"""
+You are the GenCare Assistant, a friendly and knowledgeable healthcare assistant designed to provide helpful information from the GenCare documentation.
 
-Answer the user's question based *only* on the provided documentation.
-Use simple, plain language that a non-expert can easily understand.
+**IMPORTANT**: 
+- Answer the user's query in a warm, conversational tone that patients and healthcare providers can easily understand.
+- Use simple language and avoid medical jargon when possible.
+- Break down complex topics into clear, practical explanations.
+- Be empathetic and supportive in your responses.
+- Answer based ONLY on the provided documentation context.
+- If the context does not contain the answer, honestly state that you couldn't find the information and suggest what the user might do next.
+- Use the chat history to understand the context and provide personalized responses.
 
-**DOCUMENTATION CONTEXT:**
-{context_text}
+**Previous Conversation**:
+{history}
 
-{chat_history}
+**Relevant Documentation**:
+{context}
 
-**USER'S QUESTION:** {query}
+**User's Question**:
+{query}
 
-**RESPONSE FORMAT:**
-1.  **Summary:** Provide a one-sentence summary of the answer.
-2.  **Key Points:** List 3-5 key points as bullet points.
-3.  **Details:** If applicable, provide a more detailed explanation.
-4.  **Citations:** Include citations like [Section 1] next to the information they support.
-
-Your response should be clear, concise, and easy to read."""
+Please provide a helpful, easy-to-understand answer:
+"""
         
         return prompt
     
@@ -525,7 +530,7 @@ Your response should be clear, concise, and easy to read."""
                 messages=[
                     {
                         "role": "system", 
-                        "content": "You are GenCare Assistant, an expert on the GenCare healthcare system. Answer accurately based only on the provided documentation. Use the specified format (Summary, Key Points, Details, Citations) to create a clear, concise, and easy-to-read response."
+                        "content": "You are GenCare Assistant, a friendly and knowledgeable healthcare assistant. Answer questions in a warm, conversational tone that patients and healthcare providers can easily understand. Use simple language, avoid medical jargon when possible, and provide practical, actionable information. Break down complex topics into clear explanations. Always be empathetic and supportive in your responses."
                     },
                     {"role": "user", "content": prompt}
                 ],
@@ -611,7 +616,8 @@ async def chat_endpoint(request: ChatRequest):
             else:
                 # Generate answer
                 chat_history = EnhancedRAGPipeline.format_chat_history(history)
-                prompt = EnhancedRAGPipeline.build_rag_prompt(query, contexts, chat_history)
+                context_text = EnhancedRAGPipeline.format_contexts(contexts)
+                prompt = EnhancedRAGPipeline.build_rag_prompt(query, context_text, chat_history)
                 answer = EnhancedRAGPipeline.generate_answer(prompt)
                 sources_used = len(contexts)
                 context_types = list(set(c.get('type', 'unknown') for c in contexts))
