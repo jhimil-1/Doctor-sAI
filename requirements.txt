@@ -1,20 +1,32 @@
+
 fastapi
-uvicorn[standard]
-openai
-pinecone-client
-python-dotenv
-pymongo
-python-docx
-tiktoken
+uvicorn
 pydantic
 pydantic-settings
+python-multipart
+
+# ==================== AI/ML ====================
+# OpenAI
+openai
+
+# Vector Database
+pinecone
+
+# LangChain
 langchain
-langchain-openai
 langchain-community
+langchain-openai
 
+# ==================== DATABASE ====================
+pymongo
+motor
 
+# ==================== DOCUMENT PROCESSING ====================
+python-docx
+docx2txt
+pypdf
+tiktoken
 
-<<<<<<< HEAD
-=======
-
->>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
+# ==================== DATA PROCESSING ====================
+pandas
+numpy

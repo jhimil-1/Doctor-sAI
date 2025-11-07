@@ -1,5 +1,5 @@
 """
-FastAPI backend for GenCare Assistant RAG chatbot
+FastAPI backend for GenCare Assistant RAG chatbot with LangChain integration
 """
 from fastapi import FastAPI, HTTPException, status, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,16 +7,14 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict, Any
 import logging
-<<<<<<< HEAD
 import traceback
-=======
->>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
 from datetime import datetime
 from uuid import UUID, uuid4
 from contextlib import asynccontextmanager
 
 from openai import OpenAI
 from pinecone import Pinecone
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 from config import get_settings
 from memory import ChatMemory
@@ -64,20 +62,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="GenCare Assistant API",
-    description="RAG-based chatbot grounded on BRS V1.2 documentation",
-    version="1.0.0",
+    description="RAG-based chatbot with LangChain integration, grounded on BRS V1.2 documentation",
+    version="2.0.0",
     lifespan=lifespan
 )
-
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 
 # Request/Response Models
 class SessionCreate(BaseModel):
@@ -143,6 +131,7 @@ class ChatResponse(BaseModel):
     query: str = Field(..., description="The user's original query")
     answer: str = Field(..., description="The assistant's response")
     sources_used: int = Field(..., description="Number of document sources used in the response")
+    context_types: List[str] = Field(default_factory=list, description="Types of contexts used (section, table, etc.)")
     timestamp: str = Field(..., description="ISO 8601 timestamp of when the response was generated")
     
     class Config:
@@ -152,14 +141,83 @@ class ChatResponse(BaseModel):
                 "query": "What is GenCare?",
                 "answer": "GenCare is a healthcare platform that...",
                 "sources_used": 3,
+                "context_types": ["section", "table"],
                 "timestamp": "2023-06-01T12:05:30Z"
             }
         }
 
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# RAG Components
-class RAGPipeline:
-    """Retrieval-Augmented Generation pipeline"""
+
+@app.post("/api/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
+async def create_session(request: SessionCreate = Body(...)):
+    """Create a new chat session"""
+    try:
+        session_id = str(uuid4())
+        created_at = datetime.utcnow()
+        
+        session_data = {
+            "session_id": session_id,
+            "created_at": created_at,
+            "updated_at": created_at,
+            "metadata": request.metadata or {},
+            "history": [],
+            "is_active": True
+        }
+        
+        chat_memory.create_session(session_data)
+        
+        logger.info(f"New session created with ID: {session_id}")
+        
+        return SessionResponse(
+            session_id=session_id,
+            created_at=created_at.isoformat() + "Z",
+            updated_at=created_at.isoformat() + "Z",
+            metadata=request.metadata or {},
+            is_active=True
+        )
+    except Exception as e:
+        logger.error(f"Failed to create session: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create a new session."
+        )
+
+
+@app.get("/api/sessions/{session_id}", response_model=SessionResponse)
+async def get_session(session_id: str):
+    """Get session details"""
+    try:
+        if not chat_memory.session_exists(session_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+            
+        session = chat_memory.get_session(session_id)
+        
+        return SessionResponse(
+            session_id=session["session_id"],
+            created_at=session["created_at"].isoformat() + "Z",
+            updated_at=session["updated_at"].isoformat() + "Z",
+            metadata=session["metadata"],
+            is_active=session["is_active"]
+        )
+    except Exception as e:
+        logger.error(f"Failed to retrieve session {session_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve session information."
+        )
+
+
+# Enhanced RAG Pipeline with LangChain
+class EnhancedRAGPipeline:
+    """Improved Retrieval-Augmented Generation pipeline with LangChain"""
     
     @classmethod
     def is_greeting(cls, query: str) -> bool:
@@ -168,8 +226,14 @@ class RAGPipeline:
             response = openai_client.chat.completions.create(
                 model=settings.chat_model,
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant that determines if a message is a greeting. Respond with 'true' if it's a greeting, 'false' otherwise."},
-                    {"role": "user", "content": f"Is the following message a greeting? Respond with only 'true' or 'false': {query}"}
+                    {
+                        "role": "system", 
+                        "content": "You are a classifier. Respond with ONLY 'true' or 'false'."
+                    },
+                    {
+                        "role": "user", 
+                        "content": f"Is this a greeting or introduction? '{query}'"
+                    }
                 ],
                 temperature=0.1,
                 max_tokens=5
@@ -177,26 +241,29 @@ class RAGPipeline:
             return response.choices[0].message.content.strip().lower() == 'true'
         except Exception as e:
             logger.warning(f"Error checking if message is greeting: {e}")
-            # Fallback to simple check if LLM fails
-            simple_greetings = {"hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening"}
-            return any(query.lower().startswith(greeting) for greeting in simple_greetings)
+            # Fallback to simple check
+            simple_greetings = {"hi", "hello", "hey", "greetings", "good morning", 
+                              "good afternoon", "good evening", "howdy"}
+            return any(query.lower().strip().startswith(greeting) for greeting in simple_greetings)
     
     @classmethod
     def get_greeting_response(cls, query: str = "") -> str:
         """Generate a friendly greeting response using the LLM"""
         try:
             prompt = (
-                "You are a friendly and helpful assistant for the GenCare system. "
-                "The user has sent a greeting. "
+                f"User said: '{query}'\n\n"
+                "Respond warmly and professionally as GenCare Assistant. "
                 "If they introduced themselves, acknowledge their name. "
-                "Keep your response warm, professional, and under 2 sentences. "
-                f"User's message: {query}"
+                "Keep it under 2 sentences and offer help."
             )
             
             response = openai_client.chat.completions.create(
                 model=settings.chat_model,
                 messages=[
-                    {"role": "system", "content": "You are a friendly and helpful assistant for the GenCare system."},
+                    {
+                        "role": "system", 
+                        "content": "You are GenCare Assistant, a helpful healthcare system assistant."
+                    },
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.7,
@@ -207,7 +274,6 @@ class RAGPipeline:
             
         except Exception as e:
             logger.error(f"Error generating greeting response: {e}")
-            # Fallback response if LLM fails
             return "Hello! I'm GenCare Assistant. How can I help you today?"
     
     @staticmethod
@@ -224,72 +290,163 @@ class RAGPipeline:
             raise
     
     @classmethod
-    def expand_query_terms(cls, query: str) -> List[str]:
-        """Expand query with related terms for better retrieval"""
-        # Common variations and synonyms for appointment-related queries
-        appointment_terms = {
-            'cancel': ['cancel', 'reschedule', 'change', 'modify', 'postpone'],
-            'appointment': ['appointment', 'booking', 'schedule', 'meeting', 'consultation']
-        }
-        
-        # Check if query is related to appointments
-        query_lower = query.lower()
-        if any(term in query_lower for term in ['appoint', 'book', 'schedule', 'meeting']):
-            # Add variations of the query
-            variations = [query]
-            for original, synonyms in appointment_terms.items():
-                if original in query_lower:
-                    for synonym in synonyms:
-                        if synonym != original:
-                            variations.append(query_lower.replace(original, synonym))
-            return variations
-        return [query]
+    def enhance_query_for_retrieval(cls, query: str) -> List[str]:
+        """
+        Generate query variations for better retrieval using LLM
+        """
+        try:
+            prompt = f"""Given this user query about a healthcare system: "{query}"
+
+Generate 2-3 alternative phrasings that would help retrieve relevant documentation.
+Focus on:
+- Technical terminology
+- Common variations
+- Related concepts
+
+Return as a simple list, one per line, no numbering."""
+
+            response = openai_client.chat.completions.create(
+                model=settings.chat_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You generate query variations for document retrieval."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.5,
+                max_tokens=150
+            )
+            
+            variations = [query]  # Always include original
+            content = response.choices[0].message.content.strip()
+            for line in content.split('\n'):
+                line = line.strip().strip('-•*123456789. ')
+                if line and line != query:
+                    variations.append(line)
+            
+            logger.info(f"Generated {len(variations)} query variations")
+            return variations[:3]  # Limit to 3 total
+            
+        except Exception as e:
+            logger.warning(f"Failed to generate query variations: {e}")
+            return [query]
     
     @classmethod
-<<<<<<< HEAD
-    def retrieve_context(cls, query_embedding: List[float], query_text: str = None, top_k: int = None, is_scheduling: bool = False) -> List[Dict]:
-        """Retrieve relevant chunks from Pinecone with improved relevance for scheduling and appointments"""
-=======
-    def retrieve_context(cls, query_embedding: List[float], query_text: str = None, top_k: int = None) -> List[Dict]:
-        """Retrieve relevant chunks from Pinecone with improved relevance"""
->>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
+    def retrieve_context(
+        cls, 
+        query_embedding: List[float], 
+        query_text: str = None, 
+        top_k: int = None,
+        filter_dict: Optional[Dict] = None
+    ) -> List[Dict]:
+        """
+        Retrieve relevant chunks from Pinecone with enhanced filtering
+        """
         if top_k is None:
-            top_k = settings.top_k_results * 2  # Get more results to filter
+            top_k = settings.top_k_results
         
         try:
-<<<<<<< HEAD
-            # First try with the original query
-            contexts = cls._retrieve_with_threshold(query_embedding, top_k, min_score=0.5)
+            # Build filter
+            base_filter = {"source": "BRS V1.2"}
+            if filter_dict:
+                base_filter.update(filter_dict)
             
-            # If no results, try with expanded query terms for scheduling
-            if not contexts and query_text and any(term in query_text.lower() for term in ['schedule', 'visit', 'appointment', 'book']):
-                logger.info("No results with original query, trying with scheduling-specific terms...")
-                scheduling_queries = [
-                    "how to schedule an appointment",
-                    "book a doctor visit",
-                    "make an appointment",
-                    "schedule a consultation"
-                ]
+            # Primary retrieval
+            results = pinecone_index.query(
+                vector=query_embedding,
+                top_k=top_k * 2,  # Get more to filter by score
+                include_metadata=True,
+                filter=base_filter
+            )
+            
+            contexts = []
+            seen_texts = set()
+            
+            # Process results with adaptive threshold
+            min_score = 0.7  # Start with high threshold
+            
+            for match in results['matches']:
+                if match['score'] >= min_score:
+                    text = match['metadata'].get('text', '').strip()
+                    if text and text not in seen_texts:
+                        seen_texts.add(text)
+                        contexts.append({
+                            "text": text,
+                            "score": match['score'],
+                            "source": match['metadata'].get('source', 'BRS V1.2'),
+                            "section": match['metadata'].get('section', 'Unknown'),
+                            "type": match['metadata'].get('type', 'section'),
+                            "id": match.get('id')
+                        })
+                        
+                        if len(contexts) >= top_k:
+                            break
+            
+            # If no results, try with lower threshold
+            if not contexts and query_text:
+                logger.info("No high-confidence matches, trying with lower threshold...")
+                min_score = 0.5
                 
-                for q in scheduling_queries:
+                for match in results['matches']:
+                    if match['score'] >= min_score:
+                        text = match['metadata'].get('text', '').strip()
+                        if text and text not in seen_texts:
+                            seen_texts.add(text)
+                            contexts.append({
+                                "text": text,
+                                "score": match['score'],
+                                "source": match['metadata'].get('source', 'BRS V1.2'),
+                                "section": match['metadata'].get('section', 'Unknown'),
+                                "type": match['metadata'].get('type', 'section'),
+                                "id": match.get('id')
+                            })
+                            
+                            if len(contexts) >= top_k:
+                                break
+            
+            # Try with query variations if still no results
+            if not contexts and query_text:
+                logger.info("Trying query variations...")
+                variations = cls.enhance_query_for_retrieval(query_text)
+                
+                for variation in variations[1:]:  # Skip first (original)
                     if contexts:
                         break
                     try:
-                        # Get embedding for the scheduling query
-                        scheduling_embedding = cls.get_query_embedding(q)
-                        contexts = cls._retrieve_with_threshold(scheduling_embedding, top_k, min_score=0.45)
+                        var_embedding = cls.get_query_embedding(variation)
+                        var_results = pinecone_index.query(
+                            vector=var_embedding,
+                            top_k=top_k,
+                            include_metadata=True,
+                            filter=base_filter
+                        )
+                        
+                        for match in var_results['matches']:
+                            if match['score'] >= 0.6:
+                                text = match['metadata'].get('text', '').strip()
+                                if text and text not in seen_texts:
+                                    seen_texts.add(text)
+                                    contexts.append({
+                                        "text": text,
+                                        "score": match['score'],
+                                        "source": match['metadata'].get('source', 'BRS V1.2'),
+                                        "section": match['metadata'].get('section', 'Unknown'),
+                                        "type": match['metadata'].get('type', 'section'),
+                                        "id": match.get('id'),
+                                        "retrieved_via": "variation"
+                                    })
+                                    
+                                    if len(contexts) >= top_k:
+                                        break
                     except Exception as e:
-                        logger.warning(f"Error with scheduling query '{q}': {e}")
+                        logger.warning(f"Error with variation '{variation}': {e}")
             
-            # If still no results, try with a lower threshold
-            if not contexts:
-                logger.info("No results with scheduling terms, trying with lower threshold...")
-                contexts = cls._retrieve_with_threshold(query_embedding, top_k, min_score=0.35)
-            
-            # Log the scores of retrieved contexts for debugging
+            # Log retrieval statistics
             if contexts:
                 scores = [f"{c['score']:.3f}" for c in contexts]
-                logger.info(f"Retrieved {len(contexts)} relevant contexts (scores: {', '.join(scores)})")
+                types = list(set(c.get('type', 'unknown') for c in contexts))
+                logger.info(f"Retrieved {len(contexts)} contexts (scores: {', '.join(scores)}, types: {types})")
             else:
                 logger.warning("No relevant contexts found after all retrieval attempts")
                 
@@ -299,282 +456,112 @@ class RAGPipeline:
             logger.error(f"Failed to retrieve context: {e}")
             return []
     
-    @classmethod
-    def _retrieve_with_threshold(cls, query_embedding: List[float], top_k: int, min_score: float) -> List[Dict]:
-        """Helper method to retrieve contexts with a specific score threshold"""
-        try:
-            results = pinecone_index.query(
-                vector=query_embedding,
-                top_k=top_k,
-                include_metadata=True,
-                filter={"source": "BRS V1.2"}  # Ensure we only get BRS content
-            )
-            
-            contexts = []
-            seen_texts = set()
-            
-            for match in results['matches']:
-                if match['score'] >= min_score:
-                    text = match['metadata']['text'].strip()
-                    if text and text not in seen_texts:
-                        seen_texts.add(text)
-                        contexts.append({
-                            "text": text,
-                            "score": match['score'],
-                            "source": match['metadata'].get('source', 'BRS V1.2'),
-                            "id": match.get('id')
-                        })
-                        
-                        if len(contexts) >= settings.top_k_results:
-                            break
-            
-            return contexts
-            
-        except Exception as e:
-            logger.error(f"Error in _retrieve_with_threshold: {e}")
-=======
-            # Get initial results
-            results = pinecone_index.query(
-                vector=query_embedding,
-                top_k=top_k,
-                include_metadata=True
-            )
-            
-            contexts = []
-            min_score = 0.4  # Lower threshold for better recall
-            
-            for match in results['matches']:
-                if match['score'] >= min_score:
-                    contexts.append({
-                        "text": match['metadata']['text'],
-                        "score": match['score'],
-                        "source": match['metadata'].get('source', 'BRS V1.2'),
-                        "id": match.get('id')
-                    })
-            
-            # Sort by score in descending order
-            contexts.sort(key=lambda x: x['score'], reverse=True)
-            
-            # Remove duplicates based on text content
-            seen_texts = set()
-            unique_contexts = []
-            
-            for ctx in contexts:
-                text = ctx['text'].strip()
-                if text not in seen_texts:
-                    seen_texts.add(text)
-                    unique_contexts.append(ctx)
-                    if len(unique_contexts) >= settings.top_k_results:
-                        break
-            
-            logger.info(f"Retrieved {len(unique_contexts)} relevant contexts")
-            return unique_contexts
-            
-        except Exception as e:
-            logger.error(f"Failed to retrieve context: {e}")
-            # Fall back to empty list instead of raising to allow graceful degradation
->>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
-            return []
-    
     @staticmethod
-    def format_chat_history(history: List[Dict[str, str]]) -> str:
-        """Format chat history for prompt"""
+    def format_chat_history(history: List[Dict[str, str]], max_exchanges: int = 5) -> str:
+        """Format chat history for prompt with context window management"""
         if not history:
             return ""
         
         formatted = "\n\n--- Previous Conversation ---\n"
-        for msg in history[-5:]:  # Last 5 exchanges
+        recent_history = history[-max_exchanges:]
+        
+        for msg in recent_history:
             formatted += f"User: {msg['query']}\n"
             formatted += f"Assistant: {msg['answer']}\n\n"
+        
         formatted += "--- End of Previous Conversation ---\n"
         return formatted
     
     @staticmethod
     def build_rag_prompt(query: str, contexts: List[Dict], chat_history: str) -> str:
-        """Build the final RAG prompt"""
-        context_text = "\n\n".join([
-            f"[Context {i+1}] (Relevance: {ctx['score']:.2f})\n{ctx['text']}"
-            for i, ctx in enumerate(contexts)
-        ])
+        """Build enhanced RAG prompt with structured context"""
+        # Group contexts by type
+        sections = [c for c in contexts if c.get('type') == 'section']
+        tables = [c for c in contexts if c.get('type') == 'table']
         
-        prompt = f"""You are GenCare Assistant, an expert AI assistant specialized in the GenCare system documentation (BRS V1.2).
+        context_text = ""
+        
+        if sections:
+            context_text += "=== DOCUMENTATION SECTIONS ===\n\n"
+            for i, ctx in enumerate(sections, 1):
+                section_name = ctx.get('section', 'Unknown Section')
+                context_text += f"[Section {i}: {section_name}] (Relevance: {ctx['score']:.2f})\n"
+                context_text += f"{ctx['text']}\n\n"
+        
+        if tables:
+            context_text += "=== RELATED TABLES ===\n\n"
+            for i, ctx in enumerate(tables, 1):
+                context_text += f"[Table {i}] (Relevance: {ctx['score']:.2f})\n"
+                context_text += f"{ctx['text']}\n\n"
+        
+        prompt = f"""You are GenCare Assistant, an expert AI assistant specialized in the GenCare healthcare system (BRS V1.2 documentation).
 
-Your primary responsibilities:
-1. Answer questions ONLY based on the provided BRS documentation context
-2. Provide clear, step-by-step guidance when explaining processes
-3. Maintain conversation context using chat history
-4. If information is not in the documentation, clearly state: "I'm sorry, I couldn't find that in the GenCare app."
-5. Be helpful, professional, and precise
+Answer the user's question based *only* on the provided documentation.
+Use simple, plain language that a non-expert can easily understand.
 
---- DOCUMENTATION CONTEXT ---
+**DOCUMENTATION CONTEXT:**
 {context_text}
 
 {chat_history}
 
---- CURRENT QUESTION ---
-User: {query}
+**USER'S QUESTION:** {query}
 
-Instructions:
-- Answer based ONLY on the context provided above
-- Reference specific sections when relevant
-- If the context doesn't contain the answer, say so clearly
-- Maintain continuity with previous conversation
-- Be concise but complete
-"""
+**RESPONSE FORMAT:**
+1.  **Summary:** Provide a one-sentence summary of the answer.
+2.  **Key Points:** List 3-5 key points as bullet points.
+3.  **Details:** If applicable, provide a more detailed explanation.
+4.  **Citations:** Include citations like [Section 1] next to the information they support.
+
+Your response should be clear, concise, and easy to read."""
+        
         return prompt
     
     @staticmethod
     def generate_answer(prompt: str) -> str:
+        """Generate answer using OpenAI with enhanced parameters"""
         try:
             response = openai_client.chat.completions.create(
                 model=settings.chat_model,
-                messages=[{"role": "system", "content": "You are a helpful assistant specialized in GenCare app."}, {"role": "user", "content": prompt}],
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": "You are GenCare Assistant, an expert on the GenCare healthcare system. Answer accurately based only on the provided documentation. Use the specified format (Summary, Key Points, Details, Citations) to create a clear, concise, and easy-to-read response."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
                 temperature=0.3,
-                max_tokens=1000
+                max_tokens=1500,
+                top_p=0.9,
+                frequency_penalty=0.3,
+                presence_penalty=0.3
             )
-            return response.choices[0].message.content
+            return response.choices[0].message.content.strip()
         except Exception as e:
             logger.error(f"Failed to generate answer: {e}")
-            raise
-
-
-@app.post("/api/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
-async def create_session(metadata: Optional[Dict[str, Any]] = None):
-    """
-    Create a new chat session
-    
-    This endpoint creates a new chat session with an optional metadata dictionary.
-    Returns the session details including a unique session_id that should be used
-    for subsequent chat interactions.
-    """
-    try:
-        session_id = chat_memory.create_session(metadata)
-        session = chat_memory.get_session(session_id)
-        if not session:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create session"
+            return (
+                "I apologize, but I encountered an error while generating a response. "
+                "Please try again shortly."
             )
-        return session
-    except Exception as e:
-        logger.error(f"Failed to create session: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create session: {str(e)}"
-        )
-
-
-@app.get("/api/sessions/{session_id}", response_model=SessionResponse)
-async def get_session(session_id: str):
-    """
-    Get session details
-    
-    Retrieve information about a specific chat session including its metadata
-    and creation/update timestamps.
-    """
-    try:
-        UUID(session_id, version=4)  # Validate UUID format
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid session_id format. Must be a valid UUID v4."
-        )
-    
-    session = chat_memory.get_session(session_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found"
-        )
-    
-    return session
-
-
-@app.get("/api/sessions", response_model=List[SessionResponse])
-async def list_sessions(limit: int = 100):
-    """
-    List all active sessions
-    
-    Returns a list of active chat sessions with their metadata, sorted by
-    most recently updated first.
-    """
-    try:
-        return chat_memory.list_sessions(limit=limit)
-    except Exception as e:
-        logger.error(f"Failed to list sessions: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve sessions"
-        )
-
-
-@app.delete("/api/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def end_session(session_id: str):
-    """
-    End a chat session
-    
-    Marks a session as inactive. The session and its history will be retained
-    but can no longer be used for new messages.
-    """
-    try:
-        UUID(session_id, version=4)  # Validate UUID format
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid session_id format. Must be a valid UUID v4."
-        )
-    
-    if not chat_memory.session_exists(session_id):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found"
-        )
-    
-    if not chat_memory.end_session(session_id):
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to end session"
-        )
-    
-    return None
-
 
 @app.post("/api/chat", response_model=ChatResponse, status_code=status.HTTP_200_OK)
 async def chat_endpoint(request: ChatRequest):
     """
-<<<<<<< HEAD
-    Process a chat message with enhanced scheduling and appointment handling
+    Process a chat message with enhanced RAG pipeline
     """
     logger.info(f"Processing chat request - Session: {request.session_id}, Query: '{request.query}'")
     
     try:
         session_id = request.session_id
         query = request.query.strip()
-=======
-    Process a chat message
-    
-    This endpoint processes a user's message and returns the assistant's response.
-    It requires a valid session_id and will create a new session if one doesn't exist.
-    """
-    logger.info(f"Received chat request from session: {request.session_id}")
-    
-    try:
-        session_id = request.session_id
-        query = request.query
->>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
         
         # Update session metadata if provided
         if request.metadata:
             chat_memory.update_session_metadata(session_id, request.metadata)
         
-        # Verify session exists or create a new one
+        # Verify session exists or create one
         if not chat_memory.session_exists(session_id):
             logger.info(f"Creating new session with ID: {session_id}")
-<<<<<<< HEAD
             metadata = {"auto_created": True, "first_query": query}
-=======
-            metadata = {"auto_created": True}
->>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
             if request.metadata:
                 metadata.update(request.metadata)
             chat_memory.create_session(metadata)
@@ -582,169 +569,120 @@ async def chat_endpoint(request: ChatRequest):
         # Get chat history
         history = chat_memory.get_session_history(session_id)
         
-        # Check for greetings first
-        if RAGPipeline.is_greeting(query):
-            answer = RAGPipeline.get_greeting_response(query)
+        # Check for greetings
+        if EnhancedRAGPipeline.is_greeting(query):
+            answer = EnhancedRAGPipeline.get_greeting_response(query)
             sources_used = 0
+            context_types = []
+            rag_context = None
+            message_metadata = {"is_greeting": True}
         else:
-<<<<<<< HEAD
-            # Process the query with enhanced RAG pipeline
-            query_embedding = RAGPipeline.get_query_embedding(query)
+            # Process with enhanced RAG
+            query_embedding = EnhancedRAGPipeline.get_query_embedding(query)
             
-            # Check if this is a scheduling-related query
-            is_scheduling_query = any(term in query.lower() for term in 
-                                   ['schedule', 'appointment', 'book', 'visit', 'reschedule', 'cancel'])
-            
-            # Get context with scheduling-specific handling
-            contexts = RAGPipeline.retrieve_context(
+            # Retrieve contexts
+            contexts = EnhancedRAGPipeline.retrieve_context(
                 query_embedding, 
-                query_text=query,
-                is_scheduling=is_scheduling_query
+                query_text=query
             )
-            
-            # If no results for scheduling query, try with specific scheduling prompts
-            if is_scheduling_query and not contexts:
-                scheduling_prompts = [
-                    "how to schedule an appointment in GenCare",
-                    "steps to book a doctor visit",
-                    "appointment scheduling process",
-                    "how to make a medical appointment"
-                ]
-                
-                for prompt in scheduling_prompts:
-                    if contexts:
-                        break
-                    logger.info(f"Trying scheduling prompt: {prompt}")
-                    prompt_embedding = RAGPipeline.get_query_embedding(prompt)
-                    contexts = RAGPipeline.retrieve_context(prompt_embedding, prompt, is_scheduling=True)
-            
-            # Generate response based on context
-            if not contexts:
-                # Special handling for scheduling-related queries
-                if is_scheduling_query:
-                    answer = (
-                        "I can help you schedule an appointment in the GenCare app. Here's how:\n\n"
-                        "1. Open the GenCare mobile app\n"
-                        "2. Tap on 'Appointments' in the bottom menu\n"
-                        "3. Select 'Schedule New Appointment'\n"
-                        "4. Choose your preferred doctor, date, and time\n"
-                        "5. Confirm your appointment details\n\n"
-                        "Would you like me to guide you through any specific part of this process?"
-                    )
-                else:
-                    answer = (
-                        "I couldn't find specific information about that in the GenCare documentation. "
-                        "Here are some suggestions that might help:\n\n"
-                        "1. Try rephrasing your question using different words\n"
-                        "2. Check if the information might be in a different section\n"
-                        "3. Contact our support team for further assistance"
-                    )
-                sources_used = 0
-            else:
-                # Format chat history and build prompt
-                chat_history = RAGPipeline.format_chat_history(history)
-                prompt = RAGPipeline.build_rag_prompt(query, contexts, chat_history)
-                
-                # Generate answer with enhanced instructions for scheduling
-                if is_scheduling_query:
-                    prompt += (
-                        "\nIMPORTANT: If this is about scheduling or appointments, provide clear, step-by-step instructions. "
-                        "Include all necessary details like where to click in the app. If the exact information isn't available, "
-                        "provide general guidance on how to schedule appointments in the GenCare app."
-                    )
-                
-=======
-            # Process the query with RAG pipeline
-            query_embedding = RAGPipeline.get_query_embedding(query)
-            
-            # Try with original query first
-            contexts = RAGPipeline.retrieve_context(query_embedding, query_text=query)
-            
-            # If no results, try with expanded query terms
-            if not contexts and 'appoint' in query.lower():
-                expanded_queries = RAGPipeline.expand_query_terms(query)
-                for expanded_query in expanded_queries[1:]:  # Skip the original query we already tried
-                    query_embedding = RAGPipeline.get_query_embedding(expanded_query)
-                    contexts = RAGPipeline.retrieve_context(query_embedding, query_text=expanded_query)
-                    if contexts:
-                        break
             
             if not contexts:
                 answer = (
                     "I couldn't find specific information about that in the GenCare documentation. "
-                    "Here are some suggestions that might help:\n"
-                    "1. Try using different words or phrases (e.g., 'reschedule' instead of 'cancel')\n"
-                    "2. Check if the information might be in a different section\n"
-                    "3. Contact support for assistance with specific appointment issues"
+                    "Try rephrasing with different keywords, or break the question into smaller parts. "
+                    "If you can share a bit more detail, I can search more precisely."
                 )
                 sources_used = 0
+                context_types = []
+                rag_context = {
+                    "sources_used": 0,
+                    "context_types": [],
+                    "source_documents": [],
+                    "retrieval_scores": [],
+                    "average_score": 0,
+                    "max_score": 0,
+                    "min_score": 0,
+                    "embedding_model": settings.embedding_model,
+                    "retrieval_strategy": "semantic_search",
+                    "query_variations_used": False,
+                    "retrieval_method": "standard"
+                }
+                message_metadata = {"is_greeting": False}
             else:
-                chat_history = RAGPipeline.format_chat_history(history)
-                prompt = RAGPipeline.build_rag_prompt(query, contexts, chat_history)
->>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
-                answer = RAGPipeline.generate_answer(prompt)
+                # Generate answer
+                chat_history = EnhancedRAGPipeline.format_chat_history(history)
+                prompt = EnhancedRAGPipeline.build_rag_prompt(query, contexts, chat_history)
+                answer = EnhancedRAGPipeline.generate_answer(prompt)
                 sources_used = len(contexts)
+                context_types = list(set(c.get('type', 'unknown') for c in contexts))
+                # Build RAG context for storage
+                scores = [c.get('score', 0) for c in contexts]
+                rag_context = {
+                    "sources_used": sources_used,
+                    "context_types": context_types,
+                    "source_documents": [
+                        {
+                            "id": c.get("id"),
+                            "section": c.get("section"),
+                            "type": c.get("type"),
+                            "score": c.get("score"),
+                            "source": c.get("source")
+                        } for c in contexts
+                    ],
+                    "retrieval_scores": scores,
+                    "average_score": sum(scores) / len(scores) if scores else 0,
+                    "max_score": max(scores) if scores else 0,
+                    "min_score": min(scores) if scores else 0,
+                    "embedding_model": settings.embedding_model,
+                    "retrieval_strategy": "semantic_search",
+                    "query_variations_used": any(c.get("retrieved_via") == "variation" for c in contexts),
+                    "retrieval_method": "standard"
+                }
+                message_metadata = {"is_greeting": False}
         
-        # Store the exchange in the chat history
-        chat_memory.add_message(session_id, query, answer)
+        # Store in history
+        chat_memory.add_message(session_id, query, answer, rag_context=rag_context, message_metadata=message_metadata)
         
-<<<<<<< HEAD
-        logger.info(f"Successfully processed request for session: {session_id} (sources used: {sources_used})")
-=======
-        logger.info(f"Successfully processed request for session: {session_id}")
->>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
+        logger.info(f"✅ Request processed - Session: {session_id}, Sources: {sources_used}, Types: {context_types}")
         
         return ChatResponse(
             session_id=session_id,
             query=query,
             answer=answer,
             sources_used=sources_used,
+            context_types=context_types,
             timestamp=datetime.utcnow().isoformat() + "Z"
         )
         
-<<<<<<< HEAD
     except Exception as e:
         logger.error(f"Error processing chat request: {e}", exc_info=True)
         
-        # Provide a helpful error message
         error_msg = (
             "I apologize, but I encountered an error processing your request. "
-            "Our team has been notified. Please try again in a moment or contact support if the issue persists."
+            "Please try again in a moment, or contact support if the issue persists."
         )
         
-        # Log the full error for debugging
-        logger.error(f"Full error details: {str(e)}\n{traceback.format_exc()}")
+        logger.error(f"Full error: {str(e)}\n{traceback.format_exc()}")
         
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=error_msg
-=======
-    except ValueError as e:
-        logger.error(f"Validation error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
-    except Exception as e:
-        logger.error(f"Error processing chat request: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred while processing your request: {str(e)}"
->>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
         )
 
 
 @app.get("/", tags=["Root"])
 async def root():
-    """
-    Root endpoint
-    
-    Returns basic API information and status
-    """
+    """Root endpoint with API information"""
     return {
-        "message": "GenCare Assistant API is running",
-        "version": "1.0.0",
+        "message": "GenCare Assistant API with LangChain integration",
+        "version": "2.0.0",
         "status": "healthy",
+        "features": [
+            "Enhanced document chunking with LangChain",
+            "Intelligent query expansion",
+            "Structured context retrieval",
+            "Multi-turn conversation support"
+        ],
         "endpoints": {
             "create_session": "POST /api/sessions",
             "get_session": "GET /api/sessions/{session_id}",
@@ -758,18 +696,14 @@ async def root():
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """
-    Health check endpoint
-    
-    Verifies connectivity to all required services
-    """
+    """Health check endpoint"""
     health_status = {
         "status": "healthy",
-        "services": {}
+        "services": {},
+        "version": "2.0.0"
     }
     
     try:
-        # Check MongoDB connection
         chat_memory.db.command('ping')
         health_status["services"]["mongodb"] = "connected"
     except Exception as e:
@@ -778,7 +712,6 @@ async def health_check():
         health_status["status"] = "degraded"
     
     try:
-        # Check Pinecone connection
         pinecone_index.describe_index_stats()
         health_status["services"]["pinecone"] = "connected"
     except Exception as e:
@@ -787,7 +720,6 @@ async def health_check():
         health_status["status"] = "degraded"
     
     try:
-        # Check OpenAI connection with a simple operation
         openai_client.models.list()
         health_status["services"]["openai"] = "connected"
     except Exception as e:
@@ -795,7 +727,6 @@ async def health_check():
         health_status["services"]["openai"] = "disconnected"
         health_status["status"] = "degraded"
     
-    # If any critical service is down, mark as unhealthy
     if any(status == "disconnected" for service, status in health_status["services"].items()):
         health_status["status"] = "unhealthy"
     
@@ -804,4 +735,9 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=settings.api_host, port=settings.api_port)
+    uvicorn.run(
+        app, 
+        host=settings.api_host, 
+        port=settings.api_port,
+        log_level="info"
+    )

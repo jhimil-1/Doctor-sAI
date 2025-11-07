@@ -1,18 +1,25 @@
 """
-One-time script to process BRS V1.2 document and upload to Pinecone
+Improved BRS document processing using LangChain for better chunking
 """
 import os
 import logging
 from typing import List, Dict
 from docx import Document
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from openai import OpenAI
 from pinecone import Pinecone, ServerlessSpec
-import tiktoken
+from pinecone.exceptions import PineconeApiException
 import time
+
+# LangChain imports
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader
+from langchain.schema import Document as LangChainDocument
 
 from config import get_settings
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -22,343 +29,325 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-class BRSDocumentProcessor:
-    """Process BRS document and upload to Pinecone"""
+class ImprovedBRSProcessor:
+    """Enhanced BRS processor using LangChain for intelligent chunking"""
     
     def __init__(self):
         self.openai_client = OpenAI(api_key=settings.openai_api_key)
-        self.pc = Pinecone(api_key=settings.pinecone_api_key)
-        self.encoding = tiktoken.encoding_for_model("gpt-4")
+        # Initialize Pinecone
+        self.pinecone = Pinecone(api_key=settings.pinecone_api_key)
+        self.index_name = settings.pinecone_index_name
         
-    def read_docx(self, file_path: str) -> str:
+        # Initialize LangChain text splitter with document-aware settings
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+            length_function=len,
+            separators=[
+                "\n\n\n",  # Multiple newlines (major sections)
+                "\n\n",    # Double newlines (paragraphs)
+                "\n",      # Single newlines
+                ". ",      # Sentences
+                ", ",      # Clauses
+                " ",       # Words
+                ""         # Characters (fallback)
+            ],
+            is_separator_regex=False,
+        )
+    
+    def load_document(self, file_path: str) -> List[LangChainDocument]:
         """
-        Read content from DOCX file
-        
-        Args:
-            file_path: Path to the DOCX file
-            
-        Returns:
-            Extracted text content
+        Load DOCX using LangChain loader with better structure preservation
         """
         try:
-            doc = Document(file_path)
-            full_text = []
+            # Choose loader based on file extension
+            lower_path = file_path.lower()
+            if lower_path.endswith('.pdf'):
+                loader = PyPDFLoader(file_path)
+            else:
+                loader = Docx2txtLoader(file_path)
+            documents = loader.load()
             
-            for para in doc.paragraphs:
-                if para.text.strip():
-                    full_text.append(para.text)
+            # Add source metadata
+            for doc in documents:
+                doc.metadata["source"] = "BRS V1.2"
+                doc.metadata["file_path"] = file_path
             
-            # Also extract text from tables
-            for table in doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        if cell.text.strip():
-                            full_text.append(cell.text)
+            logger.info(f"Loaded document with {len(documents)} sections")
+            return documents
             
-            content = "\n".join(full_text)
-            logger.info(f"Successfully read {len(full_text)} paragraphs from {file_path}")
-            return content
         except Exception as e:
-            logger.error(f"Failed to read DOCX file: {e}")
+            logger.error(f"Failed to load document: {e}")
             raise
     
-    def _get_semantic_boundaries(self, text: str) -> List[tuple]:
+    def extract_structured_content(self, file_path: str) -> List[LangChainDocument]:
         """
-        Use LLM to identify semantic boundaries in the text
+        Extract content with document structure (headings, sections) preserved
         """
         try:
-            # Use a prompt to identify section boundaries
-            prompt = """Analyze the following text and identify natural section breaks where the topic shifts. 
-            Return the character positions where these breaks occur as a comma-separated list of integers. 
-            Only include major topic shifts, not minor transitions.
+            # Fallback for PDFs: structured extraction is DOCX-only
+            if file_path.lower().endswith('.pdf'):
+                logger.warning("Structured extraction not supported for PDF; using simple loader instead")
+                return self.load_document(file_path)
+            doc = Document(file_path)
+            documents = []
+            current_section = {"title": "", "content": [], "level": 0}
             
-            Text:""" + text[:4000]  # Limit context window
-            
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that identifies topic boundaries in text."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                max_tokens=100
-            )
-            
-            # Parse the response to get boundary positions
-            boundaries = [0]  # Start with beginning of text
-            try:
-                # Try to parse the response as comma-separated integers
-                boundaries.extend([int(pos.strip()) for pos in response.choices[0].message.content.split(',') if pos.strip().isdigit()])
-            except:
-                # Fallback to a simpler approach if parsing fails
-                pass
+            for para in doc.paragraphs:
+                text = para.text.strip()
+                if not text:
+                    continue
                 
-            boundaries.append(len(text))  # End with end of text
-            return sorted(list(set(boundaries)))  # Remove duplicates and sort
+                # Detect headings based on style
+                style = para.style.name.lower()
+                
+                if 'heading' in style:
+                    # Save previous section if it has content
+                    if current_section["content"]:
+                        section_text = "\n".join(current_section["content"])
+                        documents.append(LangChainDocument(
+                            page_content=section_text,
+                            metadata={
+                                "source": "BRS V1.2",
+                                "section": current_section["title"],
+                                "heading_level": current_section["level"],
+                                "type": "section"
+                            }
+                        ))
+                    
+                    # Start new section
+                    level = int(style.replace('heading', '').strip() or '1')
+                    current_section = {
+                        "title": text,
+                        "content": [f"## {text}"],  # Add heading to content
+                        "level": level
+                    }
+                else:
+                    current_section["content"].append(text)
+            
+            # Add last section
+            if current_section["content"]:
+                section_text = "\n".join(current_section["content"])
+                documents.append(LangChainDocument(
+                    page_content=section_text,
+                    metadata={
+                        "source": "BRS V1.2",
+                        "section": current_section["title"],
+                        "heading_level": current_section["level"],
+                        "type": "section"
+                    }
+                ))
+            
+            # Extract tables separately
+            for idx, table in enumerate(doc.tables):
+                table_text = self._extract_table_text(table)
+                if table_text:
+                    documents.append(LangChainDocument(
+                        page_content=table_text,
+                        metadata={
+                            "source": "BRS V1.2",
+                            "type": "table",
+                            "table_index": idx
+                        }
+                    ))
+            
+            logger.info(f"Extracted {len(documents)} structured sections")
+            return documents
             
         except Exception as e:
-            logger.warning(f"Failed to get semantic boundaries: {e}. Falling back to paragraph-based chunking.")
-            return [0, len(text)]
-
-    def chunk_text(self, text: str) -> List[Dict[str, str]]:
+            logger.error(f"Failed to extract structured content: {e}")
+            raise
+    
+    def _extract_table_text(self, table) -> str:
+        """Extract and format table content"""
+        rows = []
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            if any(cells):  # Only add non-empty rows
+                rows.append(" | ".join(cells))
+        return "\n".join(rows) if rows else ""
+    
+    def chunk_documents(self, documents: List[LangChainDocument]) -> List[Dict]:
         """
-        Split text into semantic chunks using LLM-based boundary detection
-        
-        Args:
-            text: Full document text
-            
-        Returns:
-            List of chunk dictionaries with metadata
+        Chunk documents using LangChain's intelligent splitter
         """
-        # First, try to split by semantic boundaries
-        boundaries = self._get_semantic_boundaries(text)
+        # Split documents into chunks
+        chunks = self.text_splitter.split_documents(documents)
         
-        # Create initial chunks based on semantic boundaries
-        semantic_chunks = []
-        for i in range(len(boundaries) - 1):
-            start = boundaries[i]
-            end = boundaries[i+1]
-            chunk_text = text[start:end].strip()
-            if chunk_text:  # Only add non-empty chunks
-                semantic_chunks.append(chunk_text)
-        
-        # If no semantic chunks were found, fall back to paragraph-based chunking
-        if not semantic_chunks or len(semantic_chunks) == 1:
-            semantic_chunks = [p.strip() for p in text.split('\n') if p.strip()]
-        
-        # Now process chunks to ensure they're within size limits
-        chunks = []
-        current_chunk = []
-        current_length = 0
-        chunk_id = 0
-        
-        for chunk in semantic_chunks:
-            chunk_tokens = len(self.encoding.encode(chunk))
-            
-            # If chunk is too large, split it further by paragraphs
-            if chunk_tokens > settings.chunk_size * 1.5:  # Allow some flexibility
-                paragraphs = [p.strip() for p in chunk.split('\n') if p.strip()]
-                for para in paragraphs:
-                    para_tokens = len(self.encoding.encode(para))
-                    
-                    # If adding this paragraph exceeds chunk size, save current chunk
-                    if current_length + para_tokens > settings.chunk_size and current_chunk:
-                        chunk_text = "\n".join(current_chunk)
-                        chunks.append({
-                            "id": f"brs_chunk_{chunk_id}",
-                            "text": chunk_text,
-                            "metadata": {
-                                "source": "BRS V1.2",
-                                "chunk_id": chunk_id,
-                                "token_count": current_length,
-                                "chunk_type": "semantic"
-                            }
-                        })
-                        
-                        # Keep overlap for context
-                        overlap_size = 0
-                        overlap_chunks = []
-                        for i in range(len(current_chunk) - 1, -1, -1):
-                            overlap_tokens = len(self.encoding.encode(current_chunk[i]))
-                            if overlap_size + overlap_tokens <= settings.chunk_overlap:
-                                overlap_chunks.insert(0, current_chunk[i])
-                                overlap_size += overlap_tokens
-                            else:
-                                break
-                        
-                        current_chunk = overlap_chunks
-                        current_length = overlap_size
-                        chunk_id += 1
-                    
-                    current_chunk.append(para)
-                    current_length += para_tokens
-            else:
-                # If chunk is within size limits, add it as is
-                if current_chunk:  # If there's an existing chunk, save it first
-                    chunk_text = "\n".join(current_chunk)
-                    chunks.append({
-                        "id": f"brs_chunk_{chunk_id}",
-                        "text": chunk_text,
-                        "metadata": {
-                            "source": "BRS V1.2",
-                            "chunk_id": chunk_id,
-                            "token_count": current_length,
-                            "chunk_type": "semantic"
-                        }
-                    })
-                    chunk_id += 1
-                
-                # Add the new chunk
-                chunks.append({
-                    "id": f"brs_chunk_{chunk_id}",
-                    "text": chunk,
-                    "metadata": {
-                        "source": "BRS V1.2",
-                        "chunk_id": chunk_id,
-                        "token_count": chunk_tokens,
-                        "chunk_type": "semantic"
-                    }
-                })
-                chunk_id += 1
-                current_chunk = []
-                current_length = 0
-        
-        # Add the last chunk if it exists
-        if current_chunk:
-            chunk_text = "\n".join(current_chunk)
-            chunks.append({
-                "id": f"brs_chunk_{chunk_id}",
-                "text": chunk_text,
+        # Convert to our format with enhanced metadata
+        processed_chunks = []
+        for idx, chunk in enumerate(chunks):
+            processed_chunks.append({
+                "id": f"brs_chunk_{idx}",
+                "text": chunk.page_content,
                 "metadata": {
-                    "source": "BRS V1.2",
-                    "chunk_id": chunk_id,
-                    "token_count": current_length,
-                    "chunk_type": "semantic"
+                    **chunk.metadata,
+                    "chunk_id": idx,
+                    "char_count": len(chunk.page_content),
+                    "chunk_method": "langchain_recursive"
                 }
             })
         
-        logger.info(f"Created {len(chunks)} semantic chunks from document")
-        return chunks
-    
-    def get_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """
-        Generate embeddings using OpenAI
+        logger.info(f"Created {len(processed_chunks)} chunks using LangChain")
         
-        Args:
-            texts: List of text strings to embed
-            
-        Returns:
-            List of embedding vectors
+        # Log chunk size statistics
+        chunk_sizes = [len(c["text"]) for c in processed_chunks]
+        logger.info(f"Chunk size stats - Min: {min(chunk_sizes)}, "
+                   f"Max: {max(chunk_sizes)}, "
+                   f"Avg: {sum(chunk_sizes)//len(chunk_sizes)}")
+        
+        return processed_chunks
+    
+    def get_embeddings(self, texts: List[str], batch_size: int = 100) -> List[List[float]]:
         """
-        try:
-            response = self.openai_client.embeddings.create(
-                model=settings.embedding_model,
-                input=texts
-            )
-            embeddings = [item.embedding for item in response.data]
-            logger.info(f"Generated embeddings for {len(texts)} texts")
-            return embeddings
-        except Exception as e:
-            logger.error(f"Failed to generate embeddings: {e}")
-            raise
+        Generate embeddings with batching for rate limit handling
+        """
+        all_embeddings = []
+        
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            try:
+                response = self.openai_client.embeddings.create(
+                    model=settings.embedding_model,
+                    input=batch
+                )
+                embeddings = [item.embedding for item in response.data]
+                all_embeddings.extend(embeddings)
+                logger.info(f"Generated embeddings for batch {i//batch_size + 1} "
+                           f"({len(embeddings)} texts)")
+                
+                # Small delay to avoid rate limits
+                if i + batch_size < len(texts):
+                    time.sleep(0.5)
+                    
+            except Exception as e:
+                logger.error(f"Failed to generate embeddings for batch {i//batch_size + 1}: {e}")
+                raise
+        
+        return all_embeddings
     
     def create_pinecone_index(self):
-        """Create Pinecone index with correct dimensions"""
+        """Ensure Pinecone index exists (idempotent)"""
         try:
-            existing_indexes = [index.name for index in self.pc.list_indexes()]
-            
-            if settings.pinecone_index_name in existing_indexes:
-                # Delete existing index to ensure correct dimensions
-                logger.info(f"Deleting existing index: {settings.pinecone_index_name}")
-                self.pc.delete_index(settings.pinecone_index_name)
-                # Wait for the index to be fully deleted
-                time.sleep(10)
-            
-            # Create new index with correct dimensions
-            logger.info(f"Creating index: {settings.pinecone_index_name}")
-            self.pc.create_index(
-                name=settings.pinecone_index_name,
-                dimension=3072,  # text-embedding-3-large dimension
+            # If index already exists, just reuse it
+            try:
+                self.pinecone.describe_index(self.index_name)
+                logger.info(f"Index '{self.index_name}' already exists. Using existing index.")
+                return
+            except Exception:
+                pass
+
+            logger.info(f"Creating index: {self.index_name}")
+            self.pinecone.create_index(
+                name=self.index_name,
+                dimension=3072,  # text-embedding-3-large
                 metric='cosine',
                 spec=ServerlessSpec(
                     cloud='aws',
                     region=settings.pinecone_environment
                 )
             )
-            logger.info("Index created successfully with dimension 3072")
-        except Exception as e:
+            logger.info("Index created successfully")
+            time.sleep(5)  # Wait for index to be ready
+            
+        except PineconeApiException as e:
+            # Handle race or pre-existing index
+            if getattr(e, 'status', None) == 409 or 'ALREADY_EXISTS' in str(e):
+                logger.info(f"Index '{self.index_name}' already exists. Proceeding.")
+                return
             logger.error(f"Failed to create index: {e}")
             raise
     
-    def upload_to_pinecone(self, chunks: List[Dict[str, str]]):
-        """
-        Upload chunks with embeddings to Pinecone
-        
-        Args:
-            chunks: List of chunk dictionaries
-        """
+    def upload_to_pinecone(self, chunks: List[Dict]):
+        """Upload chunks with embeddings to Pinecone"""
         try:
-            index = self.pc.Index(settings.pinecone_index_name)
+            index = self.pinecone.Index(self.index_name)
             
-            # Process in batches
+            # Get all texts for embedding
+            texts = [chunk["text"] for chunk in chunks]
+            embeddings = self.get_embeddings(texts)
+            
+            # Upload in batches
             batch_size = 100
             for i in range(0, len(chunks), batch_size):
-                batch = chunks[i:i + batch_size]
-                texts = [chunk["text"] for chunk in batch]
+                batch_chunks = chunks[i:i + batch_size]
+                batch_embeddings = embeddings[i:i + batch_size]
                 
-                # Get embeddings
-                embeddings = self.get_embeddings(texts)
-                
-                # Prepare vectors for upsert
                 vectors = []
-                for j, chunk in enumerate(batch):
+                for j, chunk in enumerate(batch_chunks):
                     vectors.append({
                         "id": chunk["id"],
-                        "values": embeddings[j],
+                        "values": batch_embeddings[j],
                         "metadata": {
                             **chunk["metadata"],
-                            "text": chunk["text"]
+                            "text": chunk["text"][:1000]  # Limit metadata text size
                         }
                     })
                 
-                # Upsert to Pinecone
                 index.upsert(vectors=vectors)
                 logger.info(f"Uploaded batch {i // batch_size + 1} ({len(vectors)} vectors)")
             
-            # Get index stats
+            # Verify upload
             stats = index.describe_index_stats()
             logger.info(f"Total vectors in index: {stats['total_vector_count']}")
+            
         except Exception as e:
             logger.error(f"Failed to upload to Pinecone: {e}")
             raise
     
-    def process_and_upload(self, docx_path: str):
+    def process_and_upload(self, docx_path: str, use_structured: bool = True):
         """
-        Main pipeline: read, chunk, embed, and upload
+        Main pipeline with LangChain integration
         
         Args:
-            docx_path: Path to BRS DOCX file
+            docx_path: Path to BRS document
+            use_structured: Whether to use structured extraction (recommended)
         """
         logger.info("=" * 80)
-        logger.info("Starting BRS Document Processing Pipeline")
+        logger.info("Starting Enhanced BRS Processing with LangChain")
         logger.info("=" * 80)
         
-        # Step 1: Read document
-        logger.info("Step 1: Reading BRS document...")
-        text = self.read_docx(docx_path)
+        # Step 1: Load document
+        logger.info("Step 1: Loading document...")
+        if use_structured:
+            documents = self.extract_structured_content(docx_path)
+        else:
+            documents = self.load_document(docx_path)
         
-        # Step 2: Chunk text
-        logger.info("Step 2: Chunking document...")
-        chunks = self.chunk_text(text)
+        # Step 2: Chunk with LangChain
+        logger.info("Step 2: Chunking with LangChain...")
+        chunks = self.chunk_documents(documents)
         
-        # Step 3: Create Pinecone index
-        logger.info("Step 3: Setting up Pinecone index...")
+        # Step 3: Create index
+        logger.info("Step 3: Setting up Pinecone...")
         self.create_pinecone_index()
         
-        # Step 4: Upload to Pinecone
+        # Step 4: Upload
         logger.info("Step 4: Uploading to Pinecone...")
         self.upload_to_pinecone(chunks)
         
         logger.info("=" * 80)
-        logger.info("BRS Processing Complete!")
-        logger.info(f"Total chunks created and uploaded: {len(chunks)}")
+        logger.info("✅ Processing Complete!")
+        logger.info(f"Total chunks: {len(chunks)}")
         logger.info("=" * 80)
 
 
 def main():
-    """Main execution function"""
-    # Path to your BRS document
-    BRS_DOCX_PATH = "C:/Users/nhz/Desktop/GenCare Assistant/BRS V1.2 (1).docx"
+    """Run the improved processing pipeline"""
+    BRS_DOCX_PATH = "C:/Users/nhz/Desktop/GenCare Assistant/03cb46934164321f675385fb74ac1bed.pdf"
     
     if not os.path.exists(BRS_DOCX_PATH):
         logger.error(f"BRS document not found at: {BRS_DOCX_PATH}")
-        logger.error("Please ensure the file exists in the current directory")
         return
     
     try:
-        processor = BRSDocumentProcessor()
-        processor.process_and_upload(BRS_DOCX_PATH)
+        processor = ImprovedBRSProcessor()
+        
+        # Use structured extraction for better results
+        processor.process_and_upload(BRS_DOCX_PATH, use_structured=True)
+        
         logger.info("✅ Training completed successfully!")
+        
     except Exception as e:
         logger.error(f"❌ Training failed: {e}")
         raise

@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str
     embedding_model: str = "text-embedding-3-large"
-    chat_model: str = "gpt-4o"
+    chat_model: str = "gpt-4-turbo-preview"
     
     # Pinecone
     pinecone_api_key: str
