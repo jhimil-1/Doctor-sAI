@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict, Any
 import logging
+import traceback
 from datetime import datetime
 from uuid import UUID, uuid4
 from contextlib import asynccontextmanager
@@ -242,52 +243,86 @@ class RAGPipeline:
         return [query]
     
     @classmethod
-    def retrieve_context(cls, query_embedding: List[float], query_text: str = None, top_k: int = None) -> List[Dict]:
-        """Retrieve relevant chunks from Pinecone with improved relevance"""
+    def retrieve_context(cls, query_embedding: List[float], query_text: str = None, top_k: int = None, is_scheduling: bool = False) -> List[Dict]:
+        """Retrieve relevant chunks from Pinecone with improved relevance for scheduling and appointments"""
         if top_k is None:
             top_k = settings.top_k_results * 2  # Get more results to filter
         
         try:
-            # Get initial results
-            results = pinecone_index.query(
-                vector=query_embedding,
-                top_k=top_k,
-                include_metadata=True
-            )
+            # First try with the original query
+            contexts = cls._retrieve_with_threshold(query_embedding, top_k, min_score=0.5)
             
-            contexts = []
-            min_score = 0.4  # Lower threshold for better recall
-            
-            for match in results['matches']:
-                if match['score'] >= min_score:
-                    contexts.append({
-                        "text": match['metadata']['text'],
-                        "score": match['score'],
-                        "source": match['metadata'].get('source', 'BRS V1.2'),
-                        "id": match.get('id')
-                    })
-            
-            # Sort by score in descending order
-            contexts.sort(key=lambda x: x['score'], reverse=True)
-            
-            # Remove duplicates based on text content
-            seen_texts = set()
-            unique_contexts = []
-            
-            for ctx in contexts:
-                text = ctx['text'].strip()
-                if text not in seen_texts:
-                    seen_texts.add(text)
-                    unique_contexts.append(ctx)
-                    if len(unique_contexts) >= settings.top_k_results:
+            # If no results, try with expanded query terms for scheduling
+            if not contexts and query_text and any(term in query_text.lower() for term in ['schedule', 'visit', 'appointment', 'book']):
+                logger.info("No results with original query, trying with scheduling-specific terms...")
+                scheduling_queries = [
+                    "how to schedule an appointment",
+                    "book a doctor visit",
+                    "make an appointment",
+                    "schedule a consultation"
+                ]
+                
+                for q in scheduling_queries:
+                    if contexts:
                         break
+                    try:
+                        # Get embedding for the scheduling query
+                        scheduling_embedding = cls.get_query_embedding(q)
+                        contexts = cls._retrieve_with_threshold(scheduling_embedding, top_k, min_score=0.45)
+                    except Exception as e:
+                        logger.warning(f"Error with scheduling query '{q}': {e}")
             
-            logger.info(f"Retrieved {len(unique_contexts)} relevant contexts")
-            return unique_contexts
+            # If still no results, try with a lower threshold
+            if not contexts:
+                logger.info("No results with scheduling terms, trying with lower threshold...")
+                contexts = cls._retrieve_with_threshold(query_embedding, top_k, min_score=0.35)
+            
+            # Log the scores of retrieved contexts for debugging
+            if contexts:
+                scores = [f"{c['score']:.3f}" for c in contexts]
+                logger.info(f"Retrieved {len(contexts)} relevant contexts (scores: {', '.join(scores)})")
+            else:
+                logger.warning("No relevant contexts found after all retrieval attempts")
+                
+            return contexts
             
         except Exception as e:
             logger.error(f"Failed to retrieve context: {e}")
-            # Fall back to empty list instead of raising to allow graceful degradation
+            return []
+    
+    @classmethod
+    def _retrieve_with_threshold(cls, query_embedding: List[float], top_k: int, min_score: float) -> List[Dict]:
+        """Helper method to retrieve contexts with a specific score threshold"""
+        try:
+            results = pinecone_index.query(
+                vector=query_embedding,
+                top_k=top_k,
+                include_metadata=True,
+                filter={"source": "BRS V1.2"}  # Ensure we only get BRS content
+            )
+            
+            contexts = []
+            seen_texts = set()
+            
+            for match in results['matches']:
+                if match['score'] >= min_score:
+                    text = match['metadata']['text'].strip()
+                    if text and text not in seen_texts:
+                        seen_texts.add(text)
+                        contexts.append({
+                            "text": text,
+                            "score": match['score'],
+                            "source": match['metadata'].get('source', 'BRS V1.2'),
+                            "id": match.get('id')
+                        })
+                        
+                        if len(contexts) >= settings.top_k_results:
+                            break
+            
+            return contexts
+            
+        except Exception as e:
+            logger.error(f"Error in _retrieve_with_threshold: {e}")
             return []
     
     @staticmethod
@@ -456,16 +491,13 @@ async def end_session(session_id: str):
 @app.post("/api/chat", response_model=ChatResponse, status_code=status.HTTP_200_OK)
 async def chat_endpoint(request: ChatRequest):
     """
-    Process a chat message
-    
-    This endpoint processes a user's message and returns the assistant's response.
-    It requires a valid session_id and will create a new session if one doesn't exist.
+    Process a chat message with enhanced scheduling and appointment handling
     """
-    logger.info(f"Received chat request from session: {request.session_id}")
+    logger.info(f"Processing chat request - Session: {request.session_id}, Query: '{request.query}'")
     
     try:
         session_id = request.session_id
-        query = request.query
+        query = request.query.strip()
         
         # Update session metadata if provided
         if request.metadata:
@@ -474,7 +506,7 @@ async def chat_endpoint(request: ChatRequest):
         # Verify session exists or create a new one
         if not chat_memory.session_exists(session_id):
             logger.info(f"Creating new session with ID: {session_id}")
-            metadata = {"auto_created": True}
+            metadata = {"auto_created": True, "first_query": query}
             if request.metadata:
                 metadata.update(request.metadata)
             chat_memory.create_session(metadata)
@@ -487,40 +519,78 @@ async def chat_endpoint(request: ChatRequest):
             answer = RAGPipeline.get_greeting_response(query)
             sources_used = 0
         else:
-            # Process the query with RAG pipeline
+            # Process the query with enhanced RAG pipeline
             query_embedding = RAGPipeline.get_query_embedding(query)
             
-            # Try with original query first
-            contexts = RAGPipeline.retrieve_context(query_embedding, query_text=query)
+            # Check if this is a scheduling-related query
+            is_scheduling_query = any(term in query.lower() for term in 
+                                   ['schedule', 'appointment', 'book', 'visit', 'reschedule', 'cancel'])
             
-            # If no results, try with expanded query terms
-            if not contexts and 'appoint' in query.lower():
-                expanded_queries = RAGPipeline.expand_query_terms(query)
-                for expanded_query in expanded_queries[1:]:  # Skip the original query we already tried
-                    query_embedding = RAGPipeline.get_query_embedding(expanded_query)
-                    contexts = RAGPipeline.retrieve_context(query_embedding, query_text=expanded_query)
+            # Get context with scheduling-specific handling
+            contexts = RAGPipeline.retrieve_context(
+                query_embedding, 
+                query_text=query,
+                is_scheduling=is_scheduling_query
+            )
+            
+            # If no results for scheduling query, try with specific scheduling prompts
+            if is_scheduling_query and not contexts:
+                scheduling_prompts = [
+                    "how to schedule an appointment in GenCare",
+                    "steps to book a doctor visit",
+                    "appointment scheduling process",
+                    "how to make a medical appointment"
+                ]
+                
+                for prompt in scheduling_prompts:
                     if contexts:
                         break
+                    logger.info(f"Trying scheduling prompt: {prompt}")
+                    prompt_embedding = RAGPipeline.get_query_embedding(prompt)
+                    contexts = RAGPipeline.retrieve_context(prompt_embedding, prompt, is_scheduling=True)
             
+            # Generate response based on context
             if not contexts:
-                answer = (
-                    "I couldn't find specific information about that in the GenCare documentation. "
-                    "Here are some suggestions that might help:\n"
-                    "1. Try using different words or phrases (e.g., 'reschedule' instead of 'cancel')\n"
-                    "2. Check if the information might be in a different section\n"
-                    "3. Contact support for assistance with specific appointment issues"
-                )
+                # Special handling for scheduling-related queries
+                if is_scheduling_query:
+                    answer = (
+                        "I can help you schedule an appointment in the GenCare app. Here's how:\n\n"
+                        "1. Open the GenCare mobile app\n"
+                        "2. Tap on 'Appointments' in the bottom menu\n"
+                        "3. Select 'Schedule New Appointment'\n"
+                        "4. Choose your preferred doctor, date, and time\n"
+                        "5. Confirm your appointment details\n\n"
+                        "Would you like me to guide you through any specific part of this process?"
+                    )
+                else:
+                    answer = (
+                        "I couldn't find specific information about that in the GenCare documentation. "
+                        "Here are some suggestions that might help:\n\n"
+                        "1. Try rephrasing your question using different words\n"
+                        "2. Check if the information might be in a different section\n"
+                        "3. Contact our support team for further assistance"
+                    )
                 sources_used = 0
             else:
+                # Format chat history and build prompt
                 chat_history = RAGPipeline.format_chat_history(history)
                 prompt = RAGPipeline.build_rag_prompt(query, contexts, chat_history)
+                
+                # Generate answer with enhanced instructions for scheduling
+                if is_scheduling_query:
+                    prompt += (
+                        "\nIMPORTANT: If this is about scheduling or appointments, provide clear, step-by-step instructions. "
+                        "Include all necessary details like where to click in the app. If the exact information isn't available, "
+                        "provide general guidance on how to schedule appointments in the GenCare app."
+                    )
+                
                 answer = RAGPipeline.generate_answer(prompt)
                 sources_used = len(contexts)
         
         # Store the exchange in the chat history
         chat_memory.add_message(session_id, query, answer)
         
-        logger.info(f"Successfully processed request for session: {session_id}")
+        logger.info(f"Successfully processed request for session: {session_id} (sources used: {sources_used})")
         
         return ChatResponse(
             session_id=session_id,
@@ -530,17 +600,21 @@ async def chat_endpoint(request: ChatRequest):
             timestamp=datetime.utcnow().isoformat() + "Z"
         )
         
-    except ValueError as e:
-        logger.error(f"Validation error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
     except Exception as e:
         logger.error(f"Error processing chat request: {e}", exc_info=True)
+        
+        # Provide a helpful error message
+        error_msg = (
+            "I apologize, but I encountered an error processing your request. "
+            "Our team has been notified. Please try again in a moment or contact support if the issue persists."
+        )
+        
+        # Log the full error for debugging
+        logger.error(f"Full error details: {str(e)}\n{traceback.format_exc()}")
+        
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred while processing your request: {str(e)}"
+            detail=error_msg
         )
 
 
