@@ -7,7 +7,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict, Any
 import logging
+<<<<<<< HEAD
 import traceback
+=======
+>>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
 from datetime import datetime
 from uuid import UUID, uuid4
 from contextlib import asynccontextmanager
@@ -243,12 +246,18 @@ class RAGPipeline:
         return [query]
     
     @classmethod
+<<<<<<< HEAD
     def retrieve_context(cls, query_embedding: List[float], query_text: str = None, top_k: int = None, is_scheduling: bool = False) -> List[Dict]:
         """Retrieve relevant chunks from Pinecone with improved relevance for scheduling and appointments"""
+=======
+    def retrieve_context(cls, query_embedding: List[float], query_text: str = None, top_k: int = None) -> List[Dict]:
+        """Retrieve relevant chunks from Pinecone with improved relevance"""
+>>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
         if top_k is None:
             top_k = settings.top_k_results * 2  # Get more results to filter
         
         try:
+<<<<<<< HEAD
             # First try with the original query
             contexts = cls._retrieve_with_threshold(query_embedding, top_k, min_score=0.5)
             
@@ -323,6 +332,48 @@ class RAGPipeline:
             
         except Exception as e:
             logger.error(f"Error in _retrieve_with_threshold: {e}")
+=======
+            # Get initial results
+            results = pinecone_index.query(
+                vector=query_embedding,
+                top_k=top_k,
+                include_metadata=True
+            )
+            
+            contexts = []
+            min_score = 0.4  # Lower threshold for better recall
+            
+            for match in results['matches']:
+                if match['score'] >= min_score:
+                    contexts.append({
+                        "text": match['metadata']['text'],
+                        "score": match['score'],
+                        "source": match['metadata'].get('source', 'BRS V1.2'),
+                        "id": match.get('id')
+                    })
+            
+            # Sort by score in descending order
+            contexts.sort(key=lambda x: x['score'], reverse=True)
+            
+            # Remove duplicates based on text content
+            seen_texts = set()
+            unique_contexts = []
+            
+            for ctx in contexts:
+                text = ctx['text'].strip()
+                if text not in seen_texts:
+                    seen_texts.add(text)
+                    unique_contexts.append(ctx)
+                    if len(unique_contexts) >= settings.top_k_results:
+                        break
+            
+            logger.info(f"Retrieved {len(unique_contexts)} relevant contexts")
+            return unique_contexts
+            
+        except Exception as e:
+            logger.error(f"Failed to retrieve context: {e}")
+            # Fall back to empty list instead of raising to allow graceful degradation
+>>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
             return []
     
     @staticmethod
@@ -491,6 +542,7 @@ async def end_session(session_id: str):
 @app.post("/api/chat", response_model=ChatResponse, status_code=status.HTTP_200_OK)
 async def chat_endpoint(request: ChatRequest):
     """
+<<<<<<< HEAD
     Process a chat message with enhanced scheduling and appointment handling
     """
     logger.info(f"Processing chat request - Session: {request.session_id}, Query: '{request.query}'")
@@ -498,6 +550,18 @@ async def chat_endpoint(request: ChatRequest):
     try:
         session_id = request.session_id
         query = request.query.strip()
+=======
+    Process a chat message
+    
+    This endpoint processes a user's message and returns the assistant's response.
+    It requires a valid session_id and will create a new session if one doesn't exist.
+    """
+    logger.info(f"Received chat request from session: {request.session_id}")
+    
+    try:
+        session_id = request.session_id
+        query = request.query
+>>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
         
         # Update session metadata if provided
         if request.metadata:
@@ -506,7 +570,11 @@ async def chat_endpoint(request: ChatRequest):
         # Verify session exists or create a new one
         if not chat_memory.session_exists(session_id):
             logger.info(f"Creating new session with ID: {session_id}")
+<<<<<<< HEAD
             metadata = {"auto_created": True, "first_query": query}
+=======
+            metadata = {"auto_created": True}
+>>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
             if request.metadata:
                 metadata.update(request.metadata)
             chat_memory.create_session(metadata)
@@ -519,6 +587,7 @@ async def chat_endpoint(request: ChatRequest):
             answer = RAGPipeline.get_greeting_response(query)
             sources_used = 0
         else:
+<<<<<<< HEAD
             # Process the query with enhanced RAG pipeline
             query_embedding = RAGPipeline.get_query_embedding(query)
             
@@ -584,13 +653,46 @@ async def chat_endpoint(request: ChatRequest):
                         "provide general guidance on how to schedule appointments in the GenCare app."
                     )
                 
+=======
+            # Process the query with RAG pipeline
+            query_embedding = RAGPipeline.get_query_embedding(query)
+            
+            # Try with original query first
+            contexts = RAGPipeline.retrieve_context(query_embedding, query_text=query)
+            
+            # If no results, try with expanded query terms
+            if not contexts and 'appoint' in query.lower():
+                expanded_queries = RAGPipeline.expand_query_terms(query)
+                for expanded_query in expanded_queries[1:]:  # Skip the original query we already tried
+                    query_embedding = RAGPipeline.get_query_embedding(expanded_query)
+                    contexts = RAGPipeline.retrieve_context(query_embedding, query_text=expanded_query)
+                    if contexts:
+                        break
+            
+            if not contexts:
+                answer = (
+                    "I couldn't find specific information about that in the GenCare documentation. "
+                    "Here are some suggestions that might help:\n"
+                    "1. Try using different words or phrases (e.g., 'reschedule' instead of 'cancel')\n"
+                    "2. Check if the information might be in a different section\n"
+                    "3. Contact support for assistance with specific appointment issues"
+                )
+                sources_used = 0
+            else:
+                chat_history = RAGPipeline.format_chat_history(history)
+                prompt = RAGPipeline.build_rag_prompt(query, contexts, chat_history)
+>>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
                 answer = RAGPipeline.generate_answer(prompt)
                 sources_used = len(contexts)
         
         # Store the exchange in the chat history
         chat_memory.add_message(session_id, query, answer)
         
+<<<<<<< HEAD
         logger.info(f"Successfully processed request for session: {session_id} (sources used: {sources_used})")
+=======
+        logger.info(f"Successfully processed request for session: {session_id}")
+>>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
         
         return ChatResponse(
             session_id=session_id,
@@ -600,6 +702,7 @@ async def chat_endpoint(request: ChatRequest):
             timestamp=datetime.utcnow().isoformat() + "Z"
         )
         
+<<<<<<< HEAD
     except Exception as e:
         logger.error(f"Error processing chat request: {e}", exc_info=True)
         
@@ -615,6 +718,19 @@ async def chat_endpoint(request: ChatRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=error_msg
+=======
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Error processing chat request: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred while processing your request: {str(e)}"
+>>>>>>> f66d0ccd54062af13cfc71cef46f960e53cfdb74
         )
 
 
